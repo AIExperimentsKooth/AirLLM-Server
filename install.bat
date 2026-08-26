@@ -42,44 +42,6 @@ echo [OK] Python:
 python --version
 echo.
 
-REM ============================================================================
-REM NVIDIA GPU detection (Windows-friendly)
-REM ============================================================================
-REM Uses wmic (built into Windows) as the primary method — nvidia-smi is
-REM often not in PATH even when NVIDIA drivers are installed.
-REM ============================================================================
-set HAS_NVIDIA=0
-
-REM Method 1: wmic Win32_VideoController (always available on Windows)
-wmic path Win32_VideoController get Name >"%TEMP%\airllm_gpu.txt" 2>nul
-findstr /i "NVIDIA" "%TEMP%\airllm_gpu.txt" >nul 2>&1
-if !ERRORLEVEL! equ 0 (
-    set HAS_NVIDIA=1
-    echo [OK] NVIDIA GPU detected.
-    type "%TEMP%\airllm_gpu.txt"
-)
-del "%TEMP%\airllm_gpu.txt" 2>nul
-
-REM Method 2: nvidia-smi as fallback (gives us driver/CUDA version)
-if "!HAS_NVIDIA!"=="1" (
-    nvidia-smi --query-gpu=name,driver_version --format=csv,noheader >nul 2>&1
-    if !ERRORLEVEL! equ 0 (
-        nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>nul
-        for /f "tokens=2 delims=." %%a in ('nvidia-smi --query-gpu=driver_version --format=csv,noheader ^| find "."') do (
-            set CUDA_MAJOR=%%a
-        )
-        REM driver 525+ = CUDA 12, 470-524 = CUDA 11
-        if "!CUDA_MAJOR!" GEQ "525" ( set CUDA_VER=12 ) else ( set CUDA_VER=11 )
-    ) else (
-        REM no nvidia-smi, default to CUDA 12
-        set CUDA_VER=12
-    )
-    echo.
-) else (
-    echo [INFO] No NVIDIA GPU detected — will use CPU-only PyTorch.
-    echo.
-)
-
 REM ---- Create virtual environment ----
 if not exist venv\ (
     echo [..] Creating virtual environment...
@@ -105,83 +67,142 @@ if %ERRORLEVEL% neq 0 (
 )
 echo [OK] Virtual environment activated.
 
-REM NOTE: We deliberately do NOT upgrade pip here.  On Windows,
-REM "python -m pip install --upgrade pip" often fails because pip
-REM cannot overwrite its own running process.  The default pip that
-REM ships with the venv is sufficient to install everything we need.
-
 REM ---- Handle --force-cpu flag ----
+set FORCE_CPU=0
 if /I "%~1"=="--force-cpu" (
+    set FORCE_CPU=1
     echo.
-    echo [INFO] --force-cpu: installing CPU-only PyTorch despite NVIDIA GPU.
-    set HAS_NVIDIA=0
+    echo [INFO] --force-cpu: installing CPU-only PyTorch regardless.
 )
+if /I "%~2"=="--force-cpu" set FORCE_CPU=1
+if /I "%~3"=="--force-cpu" set FORCE_CPU=1
 
-REM ---- Install PyTorch ----
+REM ============================================================================
+REM Step 1: Install CPU-only PyTorch first (small, fast download)
+REM Then use Python to detect if CUDA is actually available.
+REM This avoids all the encoding/batch-parsing nonsense with wmic/findstr.
+REM ============================================================================
 echo.
-if "!HAS_NVIDIA!"=="1" (
-    if "!CUDA_VER!"=="12" (
-        set TORCH_URL=https://download.pytorch.org/whl/cu124
+echo [..] Step 1/4: Installing base PyTorch (CPU edition)...
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+if %ERRORLEVEL% neq 0 (
+    echo [WARN] CPU PyTorch install had issues — trying default index...
+    python -m pip install torch
+)
+echo [OK] Base PyTorch installed.
+
+REM ---- Detect CUDA via Python ----
+echo.
+echo [..] Checking for CUDA-capable GPU...
+python -c "
+import torch, sys, subprocess, os
+
+# Method 1: torch CUDA check
+if torch.cuda.is_available():
+    print('CUDA_AVAILABLE=1')
+    print('GPU=' + torch.cuda.get_device_name(0))
+    cuda_ver = torch.version.cuda
+    print('CUDA_VERSION=' + (cuda_ver or 'unknown'))
+    sys.exit(0)
+
+# Method 2: try nvidia-smi (may not be in PATH but worth checking)
+try:
+    result = subprocess.run(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader'],
+                          capture_output=True, text=True, timeout=5)
+    if result.returncode == 0 and result.stdout.strip():
+        print('CUDA_AVAILABLE=1')
+        print('GPU=' + result.stdout.strip())
+        sys.exit(0)
+except:
+    pass
+
+# Method 3: check for nvcuda.dll (NVIDIA driver present even without nvidia-smi in PATH)
+if os.path.exists(os.environ.get('SystemRoot', 'C:\\Windows') + '\\System32\\nvcuda.dll'):
+    print('CUDA_AVAILABLE=1')
+    print('GPU=NVIDIA detected via nvcuda.dll')
+    sys.exit(0)
+
+print('CUDA_AVAILABLE=0')
+" > "%TEMP%\airllm_cuda_detect.txt" 2>&1
+
+type "%TEMP%\airllm_cuda_detect.txt"
+echo.
+
+REM Parse detection result
+findstr "CUDA_AVAILABLE=1" "%TEMP%\airllm_cuda_detect.txt" >nul 2>&1
+if !ERRORLEVEL! equ 0 (
+    if "!FORCE_CPU!"=="0" (
+        set HAS_CUDA=1
+        echo [OK] CUDA-capable GPU detected!
     ) else (
-        set TORCH_URL=https://download.pytorch.org/whl/cu121
-    )
-    echo [..] Installing PyTorch with CUDA %CUDA_VER% support...
-    echo     from !TORCH_URL!
-    python -m pip install torch torchvision torchaudio --index-url !TORCH_URL!
-    if !ERRORLEVEL! neq 0 (
-        echo.
-        echo [WARN] CUDA PyTorch install failed. Trying CPU version instead...
-        python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-        if !ERRORLEVEL! neq 0 (
-            echo [WARN] CPU PyTorch also failed — trying default...
-            python -m pip install torch
-        )
+        set HAS_CUDA=0
+        echo [INFO] --force-cpu active, using CPU-only PyTorch.
     )
 ) else (
-    echo [..] Installing CPU-only PyTorch...
-    python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+    set HAS_CUDA=0
+    echo [INFO] No CUDA-capable GPU detected — using CPU-only PyTorch.
+)
+
+REM ---- Step 2: Reinstall PyTorch with CUDA if detected ----
+if "!HAS_CUDA!"=="1" (
+    echo.
+    echo [..] Step 2/4: Installing PyTorch with CUDA support...
+    python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
     if !ERRORLEVEL! neq 0 (
-        echo [WARN] CPU PyTorch install had issues — trying default...
-        python -m pip install torch
+        echo [WARN] CUDA 12.x PyTorch failed. Trying CUDA 11.x...
+        python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
     )
+    if !ERRORLEVEL! neq 0 (
+        echo [WARN] All CUDA PyTorch installs failed. Falling back to CPU...
+        python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+    )
+    echo [OK] PyTorch reinstalled.
+) else (
+    echo.
+    echo [..] Step 2/4: Skipped (CPU-only torch already installed).
 )
 
-REM ---- Verify torch ----
+REM ---- Step 3: Install AirLLM and server dependencies ----
 echo.
-echo [..] Verifying PyTorch CUDA...
-python -c "import torch; print('  PyTorch: '+torch.__version__); print('  CUDA built-in: '+str(torch.backends.cuda.is_built())); print('  CUDA available: '+str(torch.cuda.is_available())); print('  CUDA version: '+str(torch.version.cuda))" 2>&1
-if !ERRORLEVEL! neq 0 (
-    echo [WARN] Torch verification had an issue — continuing anyway.
-)
-
-REM ---- Install AirLLM and server deps ----
-echo.
-echo [..] Installing AirLLM and server dependencies...
+echo [..] Step 3/4: Installing AirLLM and server dependencies...
 python -m pip install -r requirements.txt
 if !ERRORLEVEL! neq 0 (
     echo.
     echo [ERROR] Dependency install failed. See error above.
-    echo         Check your internet connection and try again.
     pause
     exit /b 1
 )
 echo [OK] All dependencies installed.
 
-REM ---- Optional: pre-download model ----
+REM ---- Verify torch CUDA status ----
+echo.
+echo [..] Verifying final PyTorch setup...
+python -c "
+import torch
+print('  PyTorch: ' + torch.__version__)
+print('  CUDA built-in: ' + str(torch.backends.cuda.is_built()))
+print('  CUDA available: ' + str(torch.cuda.is_available()))
+if torch.cuda.is_available():
+    print('  GPU: ' + torch.cuda.get_device_name(0))
+    print('  Memory: %.1f GB' % (torch.cuda.get_device_properties(0).total_mem / 1e9))
+"
+
+REM ---- Step 4: Optional pre-download model ----
 if /I "%~1"=="--download-model" (
     echo.
-    echo [..] Pre-downloading model Qwen/Qwen3.8-27B...
+    echo [..] Step 4/4: Pre-downloading model Qwen/Qwen3.8-27B...
     echo     This will download ~16 GB from HuggingFace and shard it.
-    echo     This may take 10-30 minutes depending on your internet speed.
+    echo     May take 10-30 minutes depending on your internet speed.
     echo.
-    python -c "import os; os.environ['CUDA_VISIBLE_DEVICES'] = ''; from airllm import AutoModel; print('Downloading...'); m = AutoModel.from_pretrained('Qwen/Qwen3.8-27B'); print('Done.')"
+    python -c "import os; os.environ['CUDA_VISIBLE_DEVICES']=''; from airllm import AutoModel; print('Downloading...'); m=AutoModel.from_pretrained('Qwen/Qwen3.8-27B', device='cpu'); print('Done.')"
     if !ERRORLEVEL! neq 0 (
-        echo.
-        echo [WARN] Model download had issues.
-        echo         You can retry later: download_model.bat
+        echo [WARN] Model download had issues. Retry: download_model.bat
     ) else (
         echo [OK] Model downloaded and sharded.
     )
+) else (
+    echo.
+    echo [..] Step 4/4: Skipped (use --download-model flag to pre-download)
 )
 
 REM ---- Done ----
@@ -193,13 +214,13 @@ echo.
 echo   To start the server:
 echo     run.bat
 echo.
-echo   Or manually:
-echo     venv\Scripts\activate ^&^& python server.py
+echo   Usage:
+echo     run.bat              — starts the server (auto-detects CUDA)
+echo     run.bat --force-cpu  — force CPU mode even with CUDA torch
 echo.
-echo   The server will listen on http://0.0.0.0:8000
-echo   (accessible from any device on your LAN).
+echo   The server listens on http://0.0.0.0:8000 (LAN accessible).
 echo.
-echo   To change the model or port, set environment variables:
+echo   Configuration (set before running):
 echo     set AIRLLM_MODEL=Qwen/Qwen3.8-27B
 echo     set AIRLLM_PORT=8000
 echo.
