@@ -43,6 +43,7 @@ MAX_CONTEXT_LENGTH = int(os.environ.get("AIRLLM_MAX_CONTEXT", "65536"))
 COMPRESSION = os.environ.get("AIRLLM_COMPRESSION", None)  # "4bit", "8bit", or None
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
 LAYER_SHARDS_PATH = os.environ.get("AIRLLM_SHARDS_PATH", None)
+DELETE_ORIGINAL = os.environ.get("AIRLLM_DELETE_ORIGINAL", None)  # "true" to save disk space
 
 # ---------------------------------------------------------------------------
 # App
@@ -68,10 +69,14 @@ state = ModelState()
 # Device resolution
 # ---------------------------------------------------------------------------
 def resolve_device() -> str:
-    """Return 'cpu' or 'cuda' based on AIRLLM_DEVICE and torch capabilities."""
+    """Return 'cpu' or 'cuda' based on AIRLLM_DEVICE and torch capabilities.
+
+    Default (auto): use CUDA when available, fall back to CPU.
+    Set AIRLLM_DEVICE=cpu to force CPU even if GPU is present.
+    """
     cuda_built = torch.backends.cuda.is_built()
     cuda_avail = cuda_built and torch.cuda.is_available()
-    env = os.environ.get("AIRLLM_DEVICE", "cpu")  # safe default
+    env = os.environ.get("AIRLLM_DEVICE", "auto")
 
     if env == "cpu":
         return "cpu"
@@ -84,9 +89,12 @@ def resolve_device() -> str:
             return "cpu"
         logger.info("Using GPU: %s", torch.cuda.get_device_name(0))
         return "cuda"
-    # auto
+    # auto — use GPU when available
     if cuda_avail:
-        logger.info("CUDA available. Set AIRLLM_DEVICE=cuda to enable GPU.")
+        logger.info("CUDA detected — using GPU: %s  VRAM: %.1f GB",
+                     torch.cuda.get_device_name(0),
+                     torch.cuda.get_device_properties(0).total_mem / 1e9)
+        return "cuda"
     return "cpu"
 
 
@@ -101,28 +109,38 @@ def load_model():
     cuda_avail = cuda_built and torch.cuda.is_available()
     logger.info("torch=%s  CUDA built-in=%s  CUDA available=%s",
                 torch.__version__, cuda_built, cuda_avail)
-    if cuda_avail:
-        logger.info("GPU: %s  VRAM: %.1f GB",
-                     torch.cuda.get_device_name(0),
-                     torch.cuda.get_device_properties(0).total_mem / 1e9)
 
     # Build kwargs for AirLLM.AutoModel.from_pretrained
     kwargs = {}
 
-    # ── The core fix ─────────────────────────────────────────────────
-    # AirLLM's device="cpu" parameter tells it to never attempt CUDA ops
-    # during model loading or inference.  This is the official documented
-    # CPU path (v2.10.1+).  We use it by default for stability.
+    # --- Device selection ---
     if device == "cpu":
         kwargs["device"] = "cpu"
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+    # GPU mode: don't set device kwarg — AirLLM defaults to CUDA when
+    # torch.cuda.is_available() and no device= is passed
 
-    if COMPRESSION:
+    # --- Auto-compression for large models ---
+    # Models >= 7B benefit greatly from 4-bit compression at minimal
+    # accuracy cost.  A 27B model goes from ~54 GB to ~13.5 GB.
+    if COMPRESSION is None:
+        # Estimate model size from name (number before 'B' in model ID)
+        import re
+        size_match = re.search(r'[.-]?(\d+)B', MODEL_NAME.split('/')[-1])
+        if size_match:
+            param_b = int(size_match.group(1))
+            if param_b >= 7:
+                kwargs["compression"] = "4bit"
+                logger.info("Auto-enabled 4-bit compression for %dB model", param_b)
+    else:
         kwargs["compression"] = COMPRESSION
+
     if HF_TOKEN:
         kwargs["hf_token"] = HF_TOKEN
     if LAYER_SHARDS_PATH:
         kwargs["layer_shards_saving_path"] = LAYER_SHARDS_PATH
+    if DELETE_ORIGINAL and DELETE_ORIGINAL.lower() in ("true", "1", "yes"):
+        kwargs["delete_original"] = True
 
     # Import after env is prepared
     from airllm import AutoModel as AirLLMAutoModel
@@ -130,8 +148,8 @@ def load_model():
     logger.info("=" * 55)
     logger.info(f"Model:     {MODEL_NAME}")
     logger.info(f"Context:   {MAX_CONTEXT_LENGTH}")
-    logger.info(f"Device:    {kwargs.get('device', 'auto')}")
-    logger.info(f"Compress:  {COMPRESSION or 'none'}")
+    logger.info(f"Device:    {device}{' (GPU+RAM hybrid)' if device == 'cuda' else ''}")
+    logger.info(f"Compress:  {kwargs.get('compression', 'none')}")
     logger.info("=" * 55)
     logger.info("(First load downloads ~16 GB from HuggingFace — this takes time)")
     logger.info("")
@@ -143,6 +161,7 @@ def load_model():
         if "cuda" in str(exc).lower():
             logger.warning("CUDA error — retrying with device='cpu' and CUDA blinded")
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            kwargs.pop("compression", None)
             kwargs["device"] = "cpu"
             model = AirLLMAutoModel.from_pretrained(MODEL_NAME, **kwargs)
         else:
@@ -160,6 +179,11 @@ def load_model():
 
     logger.info(f"Loaded in {elapsed:.1f}s  device={device}")
     logger.info(f"Tokenizer max_length={tokenizer.model_max_length}")
+    if device == "cuda":
+        vram_used = torch.cuda.memory_allocated() / 1e9
+        logger.info(f"VRAM used: {vram_used:.2f} GB  (layers streamed one-at-a-time)")
+    else:
+        logger.info("(Set AIRLLM_DEVICE=cuda to use GPU if available)")
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +217,10 @@ def _build_gen_kwargs(
 
 def infer(input_ids, gen_kwargs):
     """Run inference, return (text, prompt_tokens, completion_tokens, elapsed_s)."""
+    # Move input to the correct device
+    if state.device == "cuda":
+        input_ids = input_ids.cuda()
+
     t0 = time.time()
     with torch.no_grad():
         out = state.model.generate(input_ids, **gen_kwargs)
@@ -208,7 +236,7 @@ def build_chat_prompt(messages):
 
 
 def tokenize(text):
-    """Tokenize text and return input_ids tensor."""
+    """Tokenize text and return input_ids tensor (on CPU; moved to device in infer())."""
     inputs = state.tokenizer(text, return_tensors="pt", truncation=True, max_length=MAX_CONTEXT_LENGTH)
     return inputs.input_ids
 

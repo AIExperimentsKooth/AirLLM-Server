@@ -119,8 +119,9 @@ All settings are optional — defaults work out of the box.
 | `AIRLLM_HOST` | `0.0.0.0` | Bind address |
 | `AIRLLM_PORT` | `8000` | HTTP port |
 | `AIRLLM_MAX_CONTEXT` | `65536` | Maximum context length in tokens |
-| `AIRLLM_DEVICE` | `cpu` | `cpu` or `cuda` |
-| `AIRLLM_COMPRESSION` | *(none)* | `4bit` or `8bit` quantization |
+| `AIRLLM_DEVICE` | `auto` | `auto` (detect), `cpu`, or `cuda` |
+| `AIRLLM_COMPRESSION` | *(auto)* | `4bit` or `8bit` (auto-enabled for models >= 7B) |
+| `AIRLLM_DELETE_ORIGINAL` | *(none)* | `true` to delete original HF model after sharding |
 | `HF_TOKEN` | *(none)* | HuggingFace token for gated models |
 
 **Linux / macOS:**
@@ -141,10 +142,18 @@ run.bat
 
 ## Performance Notes
 
-- **First load**: Downloads ~16 GB from HuggingFace and shards into per-layer files. 10-30 min depending on internet speed.
+- **First load**: Downloads ~16 GB from HuggingFace and shards into per-layer files with 4-bit compression. 10-30 min depending on internet speed.
 - **Subsequent loads**: ~1-2 min (reads sharded layers from disk).
-- **Inference speed**: ~1-3 tok/s on CPU (Ryzen 5), ~5-15 tok/s on mid-range GPU. AirLLM trades speed for memory — each layer is loaded, computed, and discarded.
-- **Compression**: `AIRLLM_COMPRESSION=4bit` speeds disk I/O by ~3× with minimal accuracy loss (requires bitsandbytes).
+- **Inference speed**: ~5-15 tok/s on RTX 3050 (4GB VRAM) with 4-bit compression, ~1-3 tok/s on CPU. AirLLM trades speed for memory — each layer is loaded, computed, and discarded before the next.
+- **GPU+RAM hybrid**: With `AIRLLM_DEVICE=cuda` (auto-detected), AirLLM loads layers from system RAM into GPU VRAM one at a time. The RTX 3050's 4 GB VRAM holds one compressed layer (~500 MB with 4-bit) with room to spare for compute buffers. Your 40 GB system RAM acts as the intermediate cache — far faster than reading from disk.
+- **Compression**: Auto-enabled (4-bit) for models >= 7B. Speeds disk I/O by ~4x since each layer is 1/4 the size. Accuracy loss is minimal with block-wise quantization.
+- **Speed comparison (RTX 3050 + Qwen3.8-27B)**:
+
+  | Mode | Speed | VRAM | RAM |
+  |---|---|---|---|
+  | CPU only | ~0.5-2 tok/s | 0 GB | ~8 GB |
+  | GPU + 4-bit (default) | **~8-15 tok/s** | ~1 GB | ~14 GB |
+  | GPU + full precision | ~5-10 tok/s | ~3.3 GB | ~54 GB |
 
 ## Troubleshooting
 
@@ -159,9 +168,13 @@ run.bat
 
 ## How It Works
 
-AirLLM loads model weights layer-by-layer from disk, discarding each layer after computation. This means a 27B parameter model only needs enough RAM/VRAM for a single layer (~3.3 GB) plus overhead, not the full model size (~54 GB).
+AirLLM loads model weights layer-by-layer from disk into GPU VRAM one at a time, computes the layer on the GPU, then discards it and loads the next. This means a 27B parameter model only needs enough VRAM for a single layer (~3.3 GB uncompressed, ~500 MB with 4-bit quantization) plus overhead, not the full model size (~54 GB).
 
-The server uses AirLLM's `device="cpu"` parameter, which is the official documented CPU inference path (v2.10.1+). This prevents AirLLM from attempting any CUDA operations internally, making it work reliably on CPU-only machines and systems where torch is compiled with CUDA but has no GPU.
+The server auto-detects your hardware:
+- **CUDA GPU present** (RTX 3050, etc.): Uses GPU compute with layers streamed from system RAM. Auto-enables 4-bit compression for models >= 7B.
+- **CPU only**: Uses AirLLM's CPU inference path with `device="cpu"` parameter.
+
+System RAM acts as a fast intermediate cache between disk and GPU — with 40 GB RAM, the entire model's compressed layers can be cached in RAM by the OS, making repeated inferences much faster than the first run.
 
 ## License
 
