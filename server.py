@@ -9,11 +9,17 @@ Modes:
     python server.py --chat             # interactive CLI chat
     python server.py --benchmark        # performance benchmark
 
-Loads and unloads model layers one at a time, so a 27B model uses
-~3.3 GB VRAM or ~6-8 GB RAM — no quantization required.
+Architecture: multi-tier layer cache
+  GPU VRAM → System RAM → Disk
+  Saturautes available memory, spills overflow to next tier.
+
+  On your machine (RTX 3050 4GB + 40GB RAM + Qwen3.8-27B 4-bit):
+    GPU tier: ~6-7 layers permanently resident (~500 MB each)
+    RAM tier: all ~40 layers cached (~500 MB each = ~20 GB total)
+    Disk:     only first inference or cache misses
 """
 
-import os, sys, json, time, logging, asyncio, math
+import os, sys, json, time, logging, asyncio, math, re, gc, ctypes, types
 from typing import Optional, List, Union
 
 import torch
@@ -34,21 +40,24 @@ logging.basicConfig(
 logger = logging.getLogger("airllm-server")
 
 # ---------------------------------------------------------------------------
-# Configuration  (all overridable via environment variables)
+# Configuration
 # ---------------------------------------------------------------------------
 MODEL_NAME = os.environ.get("AIRLLM_MODEL", "Qwen/Qwen3.8-27B")
 HOST = os.environ.get("AIRLLM_HOST", "0.0.0.0")
 PORT = int(os.environ.get("AIRLLM_PORT", "8000"))
 MAX_CONTEXT_LENGTH = int(os.environ.get("AIRLLM_MAX_CONTEXT", "65536"))
-COMPRESSION = os.environ.get("AIRLLM_COMPRESSION", None)  # "4bit", "8bit", or None
+COMPRESSION = os.environ.get("AIRLLM_COMPRESSION", None)
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
 LAYER_SHARDS_PATH = os.environ.get("AIRLLM_SHARDS_PATH", None)
-DELETE_ORIGINAL = os.environ.get("AIRLLM_DELETE_ORIGINAL", None)  # "true" to save disk space
+DELETE_ORIGINAL = os.environ.get("AIRLLM_DELETE_ORIGINAL", None)
+CACHE_MODE = os.environ.get("AIRLLM_CACHE", "turbo")  # "turbo" or "stream"
+VRAM_HEADROOM = float(os.environ.get("AIRLLM_VRAM_HEADROOM", "0.10"))  # 10% for compute
+RAM_HEADROOM = float(os.environ.get("AIRLLM_RAM_HEADROOM", "0.05"))   # 5% for OS
 
 # ---------------------------------------------------------------------------
-# App
+# FastAPI app
 # ---------------------------------------------------------------------------
-app = FastAPI(title="AirLLM API", version="2.0.0")
+app = FastAPI(title="AirLLM API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -56,11 +65,12 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # State
 # ---------------------------------------------------------------------------
 class ModelState:
-    model = None
+    model = None         # AirLLM model wrapper
     tokenizer = None
     device = "cpu"
     loaded = False
     model_name = ""
+    cache_stats = {}
 
 state = ModelState()
 
@@ -69,11 +79,7 @@ state = ModelState()
 # Device resolution
 # ---------------------------------------------------------------------------
 def resolve_device() -> str:
-    """Return 'cpu' or 'cuda' based on AIRLLM_DEVICE and torch capabilities.
-
-    Default (auto): use CUDA when available, fall back to CPU.
-    Set AIRLLM_DEVICE=cpu to force CPU even if GPU is present.
-    """
+    """Return 'cpu' or 'cuda'. Defaults to CUDA when available."""
     cuda_built = torch.backends.cuda.is_built()
     cuda_avail = cuda_built and torch.cuda.is_available()
     env = os.environ.get("AIRLLM_DEVICE", "auto")
@@ -87,15 +93,226 @@ def resolve_device() -> str:
         if not cuda_avail:
             logger.warning("AIRLLM_DEVICE=cuda but no GPU found — using CPU")
             return "cpu"
-        logger.info("Using GPU: %s", torch.cuda.get_device_name(0))
         return "cuda"
-    # auto — use GPU when available
     if cuda_avail:
-        logger.info("CUDA detected — using GPU: %s  VRAM: %.1f GB",
-                     torch.cuda.get_device_name(0),
-                     torch.cuda.get_device_properties(0).total_mem / 1e9)
         return "cuda"
     return "cpu"
+
+
+# ===================================================================
+# TurboCache: multi-tier layer caching (GPU → RAM → Disk)
+# ===================================================================
+class TurboCache:
+    """Caches all model layers in RAM, pins as many to GPU as VRAM allows.
+
+    Hooks into AirLLM's layer streaming system by replacing the
+    _load_streamed_layer method with a cached version. GPU-pinned
+    layers skip eviction (their _post_hook is a no-op), while RAM-only
+    layers do a fast CPU→GPU copy instead of disk→GPU.
+
+    On a 40 GB system with an RTX 3050 (4 GB VRAM), Qwen3.8-27B
+    with 4-bit compression:
+      - GPU pinned:  ~6 layers (~500 MB each ≈ ~3 GB)
+      - RAM cached:  all ~40 layers (~20 GB total)
+      - Disk:        never touched after first inference
+    """
+
+    def __init__(self, airllm, device, vram_headroom=0.10, ram_headroom=0.05):
+        self.airllm = airllm
+        self.model = airllm.model
+        self.device = device
+        self.running_device = getattr(airllm, 'running_device', 'cuda:0' if device == 'cuda' else 'cpu')
+
+        self.ram_cache = {}       # {idx: state_dict} on CPU
+        self.gpu_pinned = set()   # indices of GPU-pinned layers
+        self.gpu_bypass = set()   # idx where weights are pre-loaded on GPU modules
+        self.vram_headroom = vram_headroom
+        self.ram_headroom = ram_headroom
+
+        # Always-pinned small modules: embed (idx 0) and norm/lm_head (last)
+        self.always_pinned = set()
+
+        # Layer count
+        self.num_layers = len(airllm.layers)
+        self.streamed_indices = list(getattr(airllm, '_streamed_indices', range(self.num_layers)))
+        self._original_load = None  # saved original method
+
+    def warmup(self):
+        """Pre-load all layers, pin what fits in GPU VRAM."""
+        import psutil
+
+        # ---- Identify always-pinned modules ----
+        tie = bool(getattr(self.airllm.config, "tie_word_embeddings", False))
+        self.always_pinned.add(0)  # embedding
+        self.always_pinned.add(self.num_layers - 1)  # norm / lm_head
+        if tie:
+            self.always_pinned.discard(0)
+
+        # ---- Pre-load ALL streamed layers into RAM ----
+        logger.info(f"Pre-loading {len(self.streamed_indices)} layers into RAM...")
+        t0 = time.time()
+        loaded = 0
+        for idx in self.streamed_indices:
+            state_dict = self.airllm._load_streamed_layer(idx)
+            self.ram_cache[idx] = state_dict
+            loaded += 1
+        elapsed = time.time() - t0
+        logger.info(f"  Loaded {loaded} layers into RAM in {elapsed:.1f}s")
+
+        # ---- Calculate per-layer GPU memory ----
+        if not self.ram_cache:
+            logger.warning("No layers cached — turbo mode has nothing to work with")
+            return
+
+        sample = next(iter(self.ram_cache.values()))
+        per_layer_bytes = sum(
+            v.numel() * v.element_size() for v in sample.values()
+        )
+        per_layer_gb = per_layer_bytes / 1e9
+
+        if self.device != "cuda":
+            logger.info(f"  CPU mode — all layers cached in RAM only")
+            logger.info(f"  RAM used: {len(self.ram_cache) * per_layer_gb:.1f} GB")
+            self._install_cached_loader()
+            return
+
+        # ---- VRAM budget ----
+        vram_total = torch.cuda.get_device_properties(0).total_mem
+        vram_budget = int(vram_total * (1.0 - self.vram_headroom))
+        logger.info(f"  GPU VRAM: {vram_total/1e9:.1f} GB total, {vram_budget/1e9:.1f} GB budget")
+
+        # Subtract always-pinned
+        gpu_budget = vram_budget
+        for idx in self.always_pinned:
+            if idx in self.ram_cache:
+                gpu_budget -= per_layer_bytes
+
+        max_streamed_gpu = max(0, int(gpu_budget // per_layer_bytes))
+        logger.info(f"  Layer size: {per_layer_gb:.2f} GB (compressed)")
+        logger.info(f"  Fits on GPU: {max_streamed_gpu} streamed layers + {len(self.always_pinned)} pinned")
+
+        # ---- Pin small modules and N streamed layers to GPU ----
+        for idx in sorted(self.always_pinned):
+            if idx in self.ram_cache:
+                self._pin_to_gpu(idx)
+
+        pinned_count = len(self.always_pinned)
+        for idx in self.streamed_indices:
+            if idx in self.always_pinned:
+                continue
+            if pinned_count >= (len(self.always_pinned) + max_streamed_gpu):
+                break
+            self._pin_to_gpu(idx)
+            pinned_count += 1
+
+        logger.info(f"  GPU pinned: {pinned_count} layers ({pinned_count * per_layer_gb:.1f} GB)")
+        logger.info(f"  RAM cached: {len(self.ram_cache)} layers ({len(self.ram_cache) * per_layer_gb:.1f} GB)")
+        ram_total = psutil.virtual_memory().total
+        logger.info(f"  RAM free:   {psutil.virtual_memory().available/1e9:.1f} GB / {ram_total/1e9:.1f} GB")
+
+        # ---- Install cached hooks ----
+        self._install_cached_loader()
+
+    def _pin_to_gpu(self, idx):
+        """Move layer weights to GPU, set on HF model, mark pinned."""
+        if idx not in self.ram_cache:
+            return
+        state_dict = self.ram_cache[idx]
+        # Move to GPU and set on model modules
+        self.airllm.move_layer_to_device(state_dict)
+        self.gpu_pinned.add(idx)
+        self.gpu_bypass.add(idx)
+
+    def _install_cached_loader(self):
+        """Replace AirLLM's _load_streamed_layer with a cached version.
+
+        For GPU-pinned layers: skip loading entirely (weights already on GPU).
+        For RAM-cached layers: return from ram_cache (fast CPU→GPU copy).
+        """
+        # Save original for any fallback
+        orig_load = self.airllm._load_streamed_layer
+        orig_post = self.airllm._post_hook
+        airllm = self.airllm
+        ram_cache = self.ram_cache
+        gpu_pinned = self.gpu_pinned
+        bypass = self.gpu_bypass
+        running_device = self.running_device
+
+        # ---- Cached version of _load_streamed_layer ----
+        def cached_load(idx):
+            if idx in ram_cache:
+                return ram_cache[idx]
+            return orig_load(idx)
+
+        # ---- New pre-hook that skips load for pinned layers ----
+        def turbo_pre_hook(module, args):
+            idx = module._airllm_idx
+
+            if idx in bypass:
+                # Weights already on GPU — skip load + move
+                module._airllm_moved = []
+                # Still trigger prefetch so next layer is ready
+                return
+
+            if idx in ram_cache:
+                state_dict = ram_cache[idx]
+            else:
+                state_dict = orig_load(idx)
+                ram_cache[idx] = state_dict
+
+            module._airllm_moved = airllm.move_layer_to_device(state_dict)
+
+            # Prefetch next streamed layer into RAM (if not already cached)
+            nxt = airllm._next_streamed_idx(idx) if hasattr(airllm, '_next_streamed_idx') else None
+            if nxt is not None and nxt not in ram_cache:
+                try:
+                    ram_cache[nxt] = orig_load(nxt)
+                except Exception:
+                    pass
+
+        # ---- New post-hook that skips eviction for pinned layers ----
+        def turbo_post_hook(module, args, output):
+            idx = module._airllm_idx
+            if idx in gpu_pinned:
+                return output  # Keep weights on GPU
+
+            # Original eviction for non-pinned layers
+            if airllm.hf_quantizer is not None or getattr(airllm, '_expert_streaming', False):
+                for param_name in getattr(module, '_airllm_moved', []):
+                    from accelerate.utils.modeling import set_module_tensor_to_device
+                    set_module_tensor_to_device(airllm.model, param_name, 'meta')
+            else:
+                module.to('meta')
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return output
+
+        # ---- Remove old hooks ----
+        for idx in range(self.num_layers):
+            module = self.airllm.layers[idx]
+            module._forward_pre_hooks.clear()
+            module._forward_hooks.clear()
+
+        # ---- Register new hooks ----
+        for idx in self.streamed_indices:
+            module = self.airllm.layers[idx]
+            module._airllm_idx = idx
+            module.register_forward_pre_hook(turbo_pre_hook)
+            module.register_forward_hook(turbo_post_hook)
+
+        # Also patch the generate path for full-model operations
+        self.airllm._load_streamed_layer = types.MethodType(cached_load, self.airllm)
+
+    @property
+    def stats(self):
+        return {
+            "mode": "turbo" if self.ram_cache else "stream",
+            "layers_ram_cached": len(self.ram_cache),
+            "layers_gpu_pinned": len(self.gpu_pinned),
+            "total_layers": self.num_layers,
+            "device": self.device,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -103,29 +320,19 @@ def resolve_device() -> str:
 # ---------------------------------------------------------------------------
 def load_model():
     """Download (if needed) and load the model via AirLLM."""
-    # Diagnostics
     device = resolve_device()
     cuda_built = torch.backends.cuda.is_built()
     cuda_avail = cuda_built and torch.cuda.is_available()
     logger.info("torch=%s  CUDA built-in=%s  CUDA available=%s",
                 torch.__version__, cuda_built, cuda_avail)
 
-    # Build kwargs for AirLLM.AutoModel.from_pretrained
     kwargs = {}
-
-    # --- Device selection ---
     if device == "cpu":
         kwargs["device"] = "cpu"
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-    # GPU mode: don't set device kwarg — AirLLM defaults to CUDA when
-    # torch.cuda.is_available() and no device= is passed
 
-    # --- Auto-compression for large models ---
-    # Models >= 7B benefit greatly from 4-bit compression at minimal
-    # accuracy cost.  A 27B model goes from ~54 GB to ~13.5 GB.
+    # Auto 4-bit compression for models >= 7B
     if COMPRESSION is None:
-        # Estimate model size from name (number before 'B' in model ID)
-        import re
         size_match = re.search(r'[.-]?(\d+)B', MODEL_NAME.split('/')[-1])
         if size_match:
             param_b = int(size_match.group(1))
@@ -142,16 +349,15 @@ def load_model():
     if DELETE_ORIGINAL and DELETE_ORIGINAL.lower() in ("true", "1", "yes"):
         kwargs["delete_original"] = True
 
-    # Import after env is prepared
     from airllm import AutoModel as AirLLMAutoModel
 
     logger.info("=" * 55)
     logger.info(f"Model:     {MODEL_NAME}")
     logger.info(f"Context:   {MAX_CONTEXT_LENGTH}")
-    logger.info(f"Device:    {device}{' (GPU+RAM hybrid)' if device == 'cuda' else ''}")
+    logger.info(f"Device:    {device}")
     logger.info(f"Compress:  {kwargs.get('compression', 'none')}")
+    logger.info(f"Cache:     {CACHE_MODE}")
     logger.info("=" * 55)
-    logger.info("(First load downloads ~16 GB from HuggingFace — this takes time)")
     logger.info("")
 
     t0 = time.time()
@@ -159,11 +365,12 @@ def load_model():
         model = AirLLMAutoModel.from_pretrained(MODEL_NAME, **kwargs)
     except RuntimeError as exc:
         if "cuda" in str(exc).lower():
-            logger.warning("CUDA error — retrying with device='cpu' and CUDA blinded")
+            logger.warning("CUDA error — retrying CPU mode")
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
             kwargs.pop("compression", None)
             kwargs["device"] = "cpu"
             model = AirLLMAutoModel.from_pretrained(MODEL_NAME, **kwargs)
+            device = "cpu"
         else:
             raise
 
@@ -174,25 +381,50 @@ def load_model():
     state.model = model
     state.tokenizer = tokenizer
     state.device = device
-    state.loaded = True
     state.model_name = MODEL_NAME
 
-    logger.info(f"Loaded in {elapsed:.1f}s  device={device}")
+    logger.info(f"Base model loaded in {elapsed:.1f}s")
     logger.info(f"Tokenizer max_length={tokenizer.model_max_length}")
+
+    # ── TurboCache initialization ──
+    if CACHE_MODE == "turbo" and hasattr(model, 'layers') and len(model.layers) > 0:
+        logger.info("")
+        logger.info("─" * 55)
+        logger.info("  Initializing TurboCache (multi-tier layer cache)...")
+        logger.info("─" * 55)
+        logger.info("")
+
+        cache = TurboCache(
+            model, device,
+            vram_headroom=VRAM_HEADROOM,
+            ram_headroom=RAM_HEADROOM,
+        )
+        t0 = time.time()
+        cache.warmup()
+        cache_elapsed = time.time() - t0
+        state.cache_stats = cache.stats
+
+        logger.info("")
+        logger.info(f"TurboCache ready in {cache_elapsed:.1f}s")
+        logger.info(f"  GPU pinned: {cache.stats['layers_gpu_pinned']} layers")
+        logger.info(f"  RAM cached: {cache.stats['layers_ram_cached']} layers")
+        logger.info("")
+    else:
+        state.cache_stats = {"mode": "stream", "reason": "layers unavailable or CACHE_MODE=stream"}
+
+    state.loaded = True
     if device == "cuda":
         vram_used = torch.cuda.memory_allocated() / 1e9
-        logger.info(f"VRAM used: {vram_used:.2f} GB  (layers streamed one-at-a-time)")
-    else:
-        logger.info("(Set AIRLLM_DEVICE=cuda to use GPU if available)")
+        logger.info(f"VRAM used after cache: {vram_used:.2f} GB")
+    logger.info(f"Model ready: {MODEL_NAME}")
+    logger.info("")
 
 
 # ---------------------------------------------------------------------------
 # Shared inference helpers
 # ---------------------------------------------------------------------------
-def _build_gen_kwargs(
-    temperature=0.7, top_p=0.9, top_k=None,
-    repetition_penalty=None, max_new_tokens=2048, seed=None,
-) -> dict:
+def _build_gen_kwargs(temperature=0.7, top_p=0.9, top_k=None,
+                      repetition_penalty=None, max_new_tokens=2048, seed=None):
     kw = {
         "max_new_tokens": max_new_tokens,
         "use_cache": True,
@@ -202,12 +434,9 @@ def _build_gen_kwargs(
     if temperature is not None and temperature < 0.01:
         kw["do_sample"] = False
     else:
-        if temperature is not None:
-            kw["temperature"] = temperature
-        if top_p is not None:
-            kw["top_p"] = top_p
-        if top_k is not None:
-            kw["top_k"] = top_k
+        if temperature is not None: kw["temperature"] = temperature
+        if top_p is not None: kw["top_p"] = top_p
+        if top_k is not None: kw["top_k"] = top_k
     if repetition_penalty is not None:
         kw["repetition_penalty"] = repetition_penalty
     if seed is not None:
@@ -216,11 +445,8 @@ def _build_gen_kwargs(
 
 
 def infer(input_ids, gen_kwargs):
-    """Run inference, return (text, prompt_tokens, completion_tokens, elapsed_s)."""
-    # Move input to the correct device
     if state.device == "cuda":
         input_ids = input_ids.cuda()
-
     t0 = time.time()
     with torch.no_grad():
         out = state.model.generate(input_ids, **gen_kwargs)
@@ -231,28 +457,27 @@ def infer(input_ids, gen_kwargs):
 
 
 def build_chat_prompt(messages):
-    """Apply chat template to a list of [{'role':..., 'content':...}] dicts."""
     return state.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
 def tokenize(text):
-    """Tokenize text and return input_ids tensor (on CPU; moved to device in infer())."""
     inputs = state.tokenizer(text, return_tensors="pt", truncation=True, max_length=MAX_CONTEXT_LENGTH)
     return inputs.input_ids
 
 
 # ===================================================================
-# MODE 1: CLI Chat
+# CLI Chat
 # ===================================================================
 def run_chat():
-    """Interactive CLI chat session."""
     history = []
     print()
     print("=" * 55)
     print(f"  AirLLM Chat — {state.model_name}")
     print(f"  Device: {state.device}")
+    print(f"  Cache:  {state.cache_stats.get('mode', 'stream')}")
+    if state.cache_stats.get('layers_gpu_pinned'):
+        print(f"  GPU layers: {state.cache_stats['layers_gpu_pinned']}")
     print("=" * 55)
-    print("  Type your message and press Enter.")
     print("  Commands:  /exit  /clear  /help")
     print()
 
@@ -262,71 +487,50 @@ def run_chat():
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye.")
             break
-
         if not user:
             continue
         if user == "/exit":
-            print("Goodbye.")
-            break
+            print("Goodbye."); break
         if user == "/clear":
-            history.clear()
-            print("[History cleared]")
-            continue
+            history.clear(); print("[History cleared]"); continue
         if user == "/help":
-            print("  /exit   — quit")
-            print("  /clear  — clear conversation history")
-            print("  /help   — this message")
-            continue
+            print("  /exit  /clear  /help"); continue
 
         history.append({"role": "user", "content": user})
-
-        # Build prompt from full history
         prompt = build_chat_prompt(history)
         input_ids = tokenize(prompt)
         kw = _build_gen_kwargs(max_new_tokens=512)
 
-        # Streaming output to terminal
         t0 = time.time()
         with torch.no_grad():
             out = state.model.generate(input_ids, **kw)
         elapsed = time.time() - t0
         new_toks = out.sequences[0][input_ids.shape[1]:]
         text = state.tokenizer.decode(new_toks, skip_special_tokens=True)
-
-        tok_count = len(new_toks)
-        rate = tok_count / max(elapsed, 0.001)
+        rate = len(new_toks) / max(elapsed, 0.001)
 
         print(f"AI  > {text}", flush=True)
-        print(f"      [{tok_count} tok in {elapsed:.1f}s  {rate:.1f} tok/s]")
+        print(f"      [{len(new_toks)} tok in {elapsed:.1f}s  {rate:.1f} tok/s]")
         print()
-
         history.append({"role": "assistant", "content": text})
 
 
 # ===================================================================
-# MODE 2: Benchmark
+# Benchmark
 # ===================================================================
-BENCHMARK_PROMPTS = [
-    "What is 2+2?",                                          # ~5 tok prompt
-    "Explain the theory of relativity in one paragraph.",     # ~15 tok prompt
-    "Write a short poem about artificial intelligence.",      # ~12 tok prompt
-    "Summarize the plot of the movie Inception.",             # ~10 tok prompt
-    "What are the three laws of robotics? List them.",        # ~14 tok prompt
-]
-
 BENCHMARK_OUTPUT_LENGTHS = [1, 10, 32, 64, 128, 256]
 
-
 def run_benchmark():
-    """Run a performance benchmark and print results."""
     print()
     print("=" * 65)
     print(f"  AirLLM Benchmark — {state.model_name}")
     print(f"  Device: {state.device}")
+    print(f"  Cache:  {state.cache_stats.get('mode', 'stream')}")
+    if state.cache_stats.get('layers_gpu_pinned'):
+        print(f"  GPU pinned: {state.cache_stats['layers_gpu_pinned']} layers")
     print("=" * 65)
     print()
 
-    # Warmup run (discarded)
     logger.info("Warmup...")
     warmup = build_chat_prompt([{"role": "user", "content": "Hello."}])
     warmup_ids = tokenize(warmup)
@@ -334,9 +538,9 @@ def run_benchmark():
         _ = state.model.generate(warmup_ids, max_new_tokens=1, use_cache=True, return_dict_in_generate=True)
     logger.info("Warmup complete.\n")
 
-    # ── 1) Benchmark: fixed prompt, varying output length ──────────
+    # ── 1) Varying output length ──
     print("─" * 65)
-    print(f"  VARYING OUTPUT LENGTH (fixed prompt: ~14 tok)")
+    print("  VARYING OUTPUT LENGTH (fixed prompt: ~14 tok)")
     print("─" * 65)
     print(f"  {'max_tokens':>12} {'tok_out':>8} {'time':>8} {'tok/s':>8}  {'latency/tok':>11}")
     print(f"  {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*11}")
@@ -344,8 +548,8 @@ def run_benchmark():
     prompt = build_chat_prompt([{"role": "user", "content": "What are the three laws of robotics? List them."}])
     base_ids = tokenize(prompt)
     prompt_tok = base_ids.shape[1]
-
     output_len_results = []
+
     for target_len in BENCHMARK_OUTPUT_LENGTHS:
         kw = _build_gen_kwargs(max_new_tokens=target_len, temperature=0.7)
         t0 = time.time()
@@ -358,23 +562,21 @@ def run_benchmark():
         output_len_results.append((target_len, n_tok, elapsed, rate, lat_per_tok))
         print(f"  {target_len:>12} {n_tok:>8} {elapsed:>7.2f}s {rate:>7.1f}  {lat_per_tok:>9.0f}ms")
 
-    # ── 2) Benchmark: varying prompt length, fixed output ──────────
+    # ── 2) Varying prompt length ──
     print()
     print("─" * 65)
-    print(f"  VARYING PROMPT LENGTH (fixed: 32 output tokens)")
+    print("  VARYING PROMPT LENGTH (fixed: 32 output tokens)")
     print("─" * 65)
     print(f"  {'prompt_tok':>12} {'tok_out':>8} {'time':>8} {'tok/s':>8} {'latency/tok':>11}")
     print(f"  {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*11}")
 
-    # Build prompts of different lengths by repeating a short phrase
-    prompt_base = "What is the meaning of life? "  # ~5 tok
+    prompt_base = "What is the meaning of life? "
     prompt_len_results = []
     for repeat in [1, 5, 20, 50, 100]:
         p_text = prompt_base * repeat
         p_chat = build_chat_prompt([{"role": "user", "content": p_text}])
         p_ids = tokenize(p_chat)
         p_tok = p_ids.shape[1]
-
         kw = _build_gen_kwargs(max_new_tokens=32, temperature=0.7)
         t0 = time.time()
         with torch.no_grad():
@@ -386,13 +588,12 @@ def run_benchmark():
         prompt_len_results.append((p_tok, n_tok, elapsed, rate, lat_per_tok))
         print(f"  {p_tok:>12} {n_tok:>8} {elapsed:>7.2f}s {rate:>7.1f}  {lat_per_tok:>9.0f}ms")
 
-    # ── 3) Summary ─────────────────────────────────────────────────
+    # ── Summary ──
     print()
     print("─" * 65)
-    print(f"  SUMMARY")
+    print("  SUMMARY")
     print("─" * 65)
 
-    # Aggregate stats
     all_rates = [r[3] for r in output_len_results if r[1] > 0]
     all_rates += [r[3] for r in prompt_len_results if r[1] > 0]
 
@@ -404,25 +605,27 @@ def run_benchmark():
         print(f"  Peak:        {peak_rate:>7.1f} tok/s")
         print(f"  Min:         {min_rate:>7.1f} tok/s")
 
-    # Model-level time breakdown
-    print()
     print(f"  Model:       {state.model_name}")
     print(f"  Device:      {state.device}")
     if state.device == "cuda":
         mem = torch.cuda.memory_allocated() / 1e9
         print(f"  VRAM used:   {mem:.2f} GB")
+    print(f"  Cache:       {state.cache_stats.get('mode', 'stream')}")
+    if state.cache_stats.get('layers_gpu_pinned'):
+        print(f"  GPU pinned:  {state.cache_stats['layers_gpu_pinned']} layers")
+    if state.cache_stats.get('layers_ram_cached'):
+        print(f"  RAM cached:  {state.cache_stats['layers_ram_cached']} layers")
 
-    # Estimated time for common tasks
-    print()
-    print(f"  ESTIMATED TIMES (at {min_rate if all_rates else 0:.1f}–{max(all_rates) if all_rates else 0:.1f} tok/s):")
-    print(f"    100 tokens:   {100/max(avg_rate,0.01):>5.0f}s – {100/max(min_rate,0.01):>5.0f}s") if min_rate > 0 else None
-    print(f"    500 tokens:   {500/max(avg_rate,0.01):>5.0f}s – {500/max(min_rate,0.01):>5.0f}s") if min_rate > 0 else None
-    print(f"  (wider range = more disk I/O overhead per layer)")
+    if all_rates:
+        print(f"")
+        print(f"  ESTIMATED TIMES (at {min_rate:.1f}–{peak_rate:.1f} tok/s):")
+        print(f"    100 tokens:   {100/max(avg_rate,0.01):>5.0f}s")
+        print(f"    500 tokens:   {500/max(avg_rate,0.01):>5.0f}s")
     print()
 
 
 # ===================================================================
-# Schemas (HTTP API mode only)
+# HTTP API Schemas & Endpoints
 # ===================================================================
 class ChatMsg(BaseModel):
     role: str
@@ -449,19 +652,12 @@ class CompletionReq(BaseModel):
     seed: Optional[int] = None
 
 
-# ===================================================================
-# HTTP API Endpoints
-# ===================================================================
 @app.get("/v1/models")
 async def list_models():
     return {
         "object": "list",
-        "data": [{
-            "id": state.model_name or MODEL_NAME,
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "airllm",
-        }],
+        "data": [{"id": state.model_name or MODEL_NAME, "object": "model",
+                   "created": int(time.time()), "owned_by": "airllm"}],
     }
 
 @app.get("/health")
@@ -471,13 +667,13 @@ async def health():
         "model": state.model_name or MODEL_NAME,
         "device": state.device,
         "max_context": MAX_CONTEXT_LENGTH,
+        "cache": state.cache_stats,
     }
-
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatReq):
     if not state.loaded:
-        raise HTTPException(503, "Model still loading (first download may take long)")
+        raise HTTPException(503, "Model still loading")
     try:
         msgs = [{"role": m.role, "content": m.content} for m in req.messages]
         prompt = build_chat_prompt(msgs)
@@ -500,7 +696,6 @@ async def chat_completions(req: ChatReq):
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
         raise HTTPException(500, str(e))
-
 
 @app.post("/v1/completions")
 async def completions(req: CompletionReq):
@@ -528,7 +723,7 @@ async def completions(req: CompletionReq):
 
 
 # ---------------------------------------------------------------------------
-# Streaming (simulated word-by-word)
+# Streaming (simulated)
 # ---------------------------------------------------------------------------
 def _stream_chat(text: str, model_name: str):
     async def gen():
@@ -543,7 +738,6 @@ def _stream_chat(text: str, model_name: str):
                           "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}) + "\n\n"
         yield "data: [DONE]\n\n"
     return StreamingResponse(gen(), media_type="text/event-stream")
-
 
 def _stream_text(text: str, model_name: str):
     async def gen():
@@ -564,23 +758,16 @@ def _stream_text(text: str, model_name: str):
 # Entry
 # ===================================================================
 if __name__ == "__main__":
-    # Parse mode from first CLI arg (strip --chat, --benchmark, or nothing)
     mode = "server"
-    remaining_args = [a for a in sys.argv[1:] if not a.startswith("--")]
     for a in sys.argv[1:]:
-        if a == "--chat":
-            mode = "chat"
-        elif a == "--benchmark":
-            mode = "benchmark"
-        elif a == "--help" or a == "-h":
-            print(__doc__)
-            sys.exit(0)
-
-    sys.argv = [sys.argv[0]] + remaining_args  # clean args for other consumers
+        if a == "--chat": mode = "chat"
+        elif a == "--benchmark": mode = "benchmark"
+        elif a == "--help" or a == "-h": print(__doc__); sys.exit(0)
 
     logger.info("AirLLM OpenAI-Compatible Server")
     logger.info(f"Model:   {MODEL_NAME}")
     logger.info(f"Context: {MAX_CONTEXT_LENGTH}")
+    logger.info(f"Cache:   {CACHE_MODE}")
     logger.info(f"Mode:    {mode}")
     logger.info("")
 
