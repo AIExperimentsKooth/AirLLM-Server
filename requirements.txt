@@ -1,5 +1,6 @@
-# AirLLM OpenAI-Compatible Server - Windows Dependencies
-# Install: pip install -r requirements.txt
+# AirLLM OpenAI-Compatible Server - Dependencies (cross-platform)
+# Install via install.sh (Linux/macOS) or install.bat (Windows).
+# These scripts install PyTorch separately with the right CUDA support.
 
 # Core: AirLLM with CPU/GPU layer streaming
 airllm>=3.0.0

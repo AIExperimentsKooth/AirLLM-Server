@@ -1,6 +1,8 @@
 # AirLLM OpenAI-Compatible Server
 
-Serve a 27B parameter model (Qwen3.8-27B) on a **single 4 GB GPU, or even on CPU** — using AirLLM's layer-by-layer streaming so your VRAM/RAM never holds more than one layer at a time. Exposes the model as a standard OpenAI-format API so any tool (Open WebUI, LobeChat, LibreChat, Cursor, VS Code Copilot, custom scripts) can use it over your LAN.
+Serve a 27B parameter model (Qwen3.8-27B) on a **single 4 GB GPU, or even on CPU-only hardware** — using AirLLM's layer-by-layer streaming so your VRAM/RAM never holds more than one layer at a time.
+
+Works on **Windows, Linux, and macOS**. Exposes the model as a standard OpenAI-format API so any tool (Open WebUI, LobeChat, Cursor, VS Code, custom scripts) can use it over your LAN.
 
 ```
 ┌─────────────┐    POST /v1/chat/completions    ┌─────────────────┐
@@ -20,67 +22,66 @@ Serve a 27B parameter model (Qwen3.8-27B) on a **single 4 GB GPU, or even on CPU
 | Item | Minimum | Recommended |
 |---|---|---|
 | RAM | 8 GB | 16 GB |
-| VRAM | integrated (CPU mode) | 4 GB GPU |
+| VRAM | none (CPU mode) | 4 GB GPU |
 | Disk | 40 GB free | 60 GB+ SSD |
 | Python | 3.10+ | 3.11+ |
-| OS | Windows 10/11 | Windows 11 |
+| OS | Windows 10/11, Linux, macOS | any |
 
-Model size: ~16 GB download, ~30 GB during sharding (temporary), ~20 GB cached afterward.
+Model download: ~16 GB, ~30 GB during sharding, ~20 GB cached.
 
 ## Quick Start
 
+**Windows:**
+
 ```
 install.bat
 run.bat
 ```
 
-Or clone directly from GitHub:
+**Linux / macOS:**
 
+```bash
+bash install.sh
+bash run.sh
 ```
+
+Or clone from GitHub:
+
+```bash
 git clone https://github.com/AIExperimentsKooth/AirLLM-Server.git
 cd AirLLM-Server
-install.bat
-run.bat
+bash install.sh    # or install.bat on Windows
+bash run.sh
 ```
 
 ## Updating
 
-```
-update.bat
-```
+**Windows:** `update.bat`
+**Linux / macOS:** `bash update.sh`
 
-Pulls the latest version from GitHub. Keeps your virtual environment and cached model intact.
-
-**Step by step:**
-
-1. **Install** — double-click `install.bat`. It creates a Python venv and installs PyTorch (CPU edition, safe on any Windows machine) plus AirLLM and the web server.
-
-2. **Run** — double-click `run.bat`. The **first run downloads ~16 GB** from HuggingFace and shards it into per-layer files. This takes 10-30 minutes depending on your internet. Subsequent starts load from cache in ~1-2 minutes.
-
-3. **Use it** — once the server says "listening on http://0.0.0.0:8000", you can curl it:
-
-```
-curl http://localhost:8000/v1/chat/completions ^
-  -H "Content-Type: application/json" ^
-  -d "{\"model\":\"Qwen/Qwen3.8-27B\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}"
-```
+Keeps your virtual environment and cached model intact.
 
 ## Files
 
 ```
 airllm-server/
-├── install.bat           # One-click setup (venv + deps)
-├── run.bat               # Start the server
-├── download_model.bat    # Pre-download the model before first run
-├── update.bat           # Pull the latest code from GitHub
-├── server.py             # The actual API server
-├── requirements.txt      # Python dependencies
-└── README.md             # This file
+├── server.py             # The API server (cross-platform)
+├── requirements.txt      # Python dependencies (no torch — installed by scripts)
+│
+├── install.sh            # Linux / macOS installer
+├── run.sh                # Linux / macOS runner
+├── update.sh             # Linux / macOS updater
+│
+├── install.bat           # Windows installer
+├── run.bat               # Windows runner
+├── update.bat            # Windows updater
+├── download_model.bat    # Windows pre-download helper
+│
+├── README.md             # This file
+└── .gitignore
 ```
 
 ## API Endpoints
-
-The server implements the OpenAI API spec. Use any OpenAI-compatible client:
 
 | Endpoint | Description |
 |---|---|
@@ -96,7 +97,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://192.168.1.100:8000/v1",  # your server's LAN IP
-    api_key="not-needed",                       # AirLLM doesn't require a key
+    api_key="not-needed",
 )
 
 response = client.chat.completions.create(
@@ -108,53 +109,59 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-### Open WebUI / LobeChat
-
-In your chat UI's provider settings:
-- **API URL**: `http://<YOUR_LAN_IP>:8000/v1`
-- **API Key**: leave blank or enter any string
-- **Model**: `Qwen/Qwen3.8-27B`
-
 ## Configuration (Environment Variables)
 
-All settings are optional — the defaults work out of the box.
+All settings are optional — defaults work out of the box.
 
 | Variable | Default | Description |
 |---|---|---|
 | `AIRLLM_MODEL` | `Qwen/Qwen3.8-27B` | HuggingFace model ID |
-| `AIRLLM_HOST` | `0.0.0.0` | Bind address (0.0.0.0 = all interfaces) |
+| `AIRLLM_HOST` | `0.0.0.0` | Bind address |
 | `AIRLLM_PORT` | `8000` | HTTP port |
 | `AIRLLM_MAX_CONTEXT` | `65536` | Maximum context length in tokens |
-| `AIRLLM_DEVICE` | `auto` | `auto`, `cpu`, or `cuda` |
-| `AIRLLM_COMPRESSION` | *(none)* | `4bit` or `8bit` for block-wise quantization |
+| `AIRLLM_DEVICE` | `cpu` | `cpu` or `cuda` |
+| `AIRLLM_COMPRESSION` | *(none)* | `4bit` or `8bit` quantization |
 | `HF_TOKEN` | *(none)* | HuggingFace token for gated models |
-| `AIRLLM_SHARDS_PATH` | *(default cache)* | Custom path for layer shards |
 
-Set them before starting:
+**Linux / macOS:**
+
+```bash
+export AIRLLM_PORT=8080
+export AIRLLM_DEVICE=cuda
+bash run.sh
+```
+
+**Windows:**
 
 ```
 set AIRLLM_PORT=8080
-set AIRLLM_DEVICE=auto
+set AIRLLM_DEVICE=cuda
 run.bat
 ```
 
 ## Performance Notes
 
-- **First load**: Downloads ~16 GB from HuggingFace and shards into per-layer files. Takes 10-30 min depending on internet speed.
+- **First load**: Downloads ~16 GB from HuggingFace and shards into per-layer files. 10-30 min depending on internet speed.
 - **Subsequent loads**: ~1-2 min (reads sharded layers from disk).
-- **Inference speed**: ~1-3 tokens/sec on CPU (Ryzen 5), ~5-15 tok/s on a mid-range GPU. AirLLM trades speed for memory efficiency — each layer is loaded, computed, and discarded before the next.
-- **Compression**: Set `AIRLLM_COMPRESSION=4bit` to shrink each layer's weight size by 4×, speeding up disk I/O by ~3× with minimal accuracy loss (requires bitsandbytes).
+- **Inference speed**: ~1-3 tok/s on CPU (Ryzen 5), ~5-15 tok/s on mid-range GPU. AirLLM trades speed for memory — each layer is loaded, computed, and discarded.
+- **Compression**: `AIRLLM_COMPRESSION=4bit` speeds disk I/O by ~3× with minimal accuracy loss (requires bitsandbytes).
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `"Model not loaded yet"` | Wait — first load takes 10-30 min. Check the console for progress. |
-| Disk full | The model needs ~30 GB during sharding. Run `download_model.bat` first to see the real size. |
-| Slow inference | Expected on CPU. Use `AIRLLM_COMPRESSION=4bit` for ~3× speedup. |
-| HuggingFace download fails | Check your internet. Try `download_model.bat` separately. |
-| No CUDA GPU | The server auto-detects and falls back to CPU. No action needed. |
+| `CUDA built-in=True, CUDA available=False` | Normal when torch was compiled with CUDA but no GPU is present. The `device="cpu"` parameter handles this. |
+| `"Torch not compiled with CUDA enabled"` | Only happens with CPU-only torch builds. Fixed by `device="cpu"` parameter, with a try/except retry as fallback. |
+| `"Model not loaded yet"` | First load takes 10-30 min. Console shows progress. |
+| Disk full | Model needs ~30 GB during sharding. Use `download_model.bat` or `--download-model` separately first. |
+| Slow inference | Expected on CPU. Set `AIRLLM_COMPRESSION=4bit` for ~3× speedup. |
 | Port conflict | Set `AIRLLM_PORT=8080` or another free port. |
+
+## How It Works
+
+AirLLM loads model weights layer-by-layer from disk, discarding each layer after computation. This means a 27B parameter model only needs enough RAM/VRAM for a single layer (~3.3 GB) plus overhead, not the full model size (~54 GB).
+
+The server uses AirLLM's `device="cpu"` parameter, which is the official documented CPU inference path (v2.10.1+). This prevents AirLLM from attempting any CUDA operations internally, making it work reliably on CPU-only machines and systems where torch is compiled with CUDA but has no GPU.
 
 ## License
 
