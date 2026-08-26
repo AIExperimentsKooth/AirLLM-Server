@@ -79,7 +79,7 @@ if exist venv\ (
     echo.
     echo [..] Checking for dependency changes...
     call venv\Scripts\activate.bat
-    pip install -r requirements.txt --quiet
+    python -m pip install -r requirements.txt
     if !ERRORLEVEL! neq 0 (
         echo [WARN] Dependency reinstall had issues.
     ) else (
