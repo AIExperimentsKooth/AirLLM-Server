@@ -121,14 +121,25 @@ def _resolve_device() -> str:
 # ---------------------------------------------------------------------------
 def load_model_blocking():
     """Called during uvicorn startup.  Downloads the model from HF if not cached."""
-    # BEFORE loading AirLLM: blind it to CUDA if torch wasn't built with CUDA support,
-    # or if we're forcing CPU mode.  AirLLM internally tries ``torch.cuda`` calls
-    # during ``from_pretrained()`` and throws "Torch not compiled with CUDA enabled"
-    # even when none of our code ever calls ``.cuda()``.
-    if not torch.backends.cuda.is_built() or not torch.cuda.is_available():
+    # ── Diagnostics ──────────────────────────────────────────────────────
+    cuda_built = torch.backends.cuda.is_built()
+    cuda_available = cuda_built and torch.cuda.is_available()
+    logger.info("PyTorch %s  CUDA built-in=%s  CUDA available=%s",
+                torch.__version__, cuda_built, cuda_available)
+    if cuda_available:
+        logger.info("GPU: %s", torch.cuda.get_device_name(0))
+
+    # ── Step 1: blind CUDA if torch can't use it ────────────────────────
+    # AirLLM internally tries torch CUDA functions during from_pretrained()
+    # even when it doesn't need them.  If torch was compiled without CUDA,
+    # those calls crash with "Torch not compiled with CUDA enabled"
+    # regardless of CUDA_VISIBLE_DEVICES.  The set-and-retry below catches
+    # that and forces a CPU-mode retry.
+    if not cuda_built or not cuda_available:
         logger.info("Setting CUDA_VISIBLE_DEVICES='' to prevent AirLLM CUDA probe")
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
+    # ── Step 2: load ────────────────────────────────────────────────────
     from airllm import AutoModel as AirLLMAutoModel
 
     logger.info("=" * 60)
@@ -140,7 +151,6 @@ def load_model_blocking():
     logger.info("")
 
     t0 = time.time()
-
     kwargs = {}
     if COMPRESSION:
         kwargs["compression"] = COMPRESSION
@@ -149,7 +159,22 @@ def load_model_blocking():
     if LAYER_SHARDS_PATH:
         kwargs["layer_shards_saving_path"] = LAYER_SHARDS_PATH
 
-    model = AirLLMAutoModel.from_pretrained(MODEL_NAME, **kwargs)
+    try:
+        model = AirLLMAutoModel.from_pretrained(MODEL_NAME, **kwargs)
+    except RuntimeError as exc:
+        exc_text = str(exc).lower()
+        if "cuda" in exc_text:
+            logger.warning(
+                "CUDA-related error during model load (even though torch "
+                "appears CUDA-capable).  Retrying with CUDA blinded."
+            )
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            # Also force device=None if AirLLM accepts it
+            kwargs["device"] = "cpu"
+            model = AirLLMAutoModel.from_pretrained(MODEL_NAME, **kwargs)
+        else:
+            raise
+
     tokenizer = model.tokenizer
 
     # Validate / extend context length
@@ -166,6 +191,12 @@ def load_model_blocking():
 
     logger.info(f"Model loaded in {elapsed:.1f}s on device: {device}")
     logger.info(f"Tokenizer max_length set to: {tokenizer.model_max_length}")
+    if device == "cpu" and cuda_available:
+        logger.warning(
+            "CUDA GPU detected but model is running on CPU. "
+            "This probably means AirLLM's internal CUDA calls failed. "
+            "Set AIRLLM_DEVICE=cuda to force GPU mode."
+        )
     logger.info(f"Server listening on http://{HOST}:{PORT}")
     logger.info("")
 

@@ -1,7 +1,6 @@
 @echo off
 REM ============================================================================
 REM Pre-download the model so the server starts faster on first run.
-REM
 REM Usage:
 REM   download_model.bat              -- download default model (Qwen3.8-27B)
 REM   download_model.bat Qwen/Qwen3-32B  -- download a different model
@@ -32,18 +31,10 @@ if not exist venv\ (
 
 call venv\Scripts\activate.bat
 
-python -c ^
-"import sys; sys.exit(0)" 2>nul
-if %ERRORLEVEL% neq 0 (
-    echo [ERROR] Failed to activate virtual environment.
-    pause
-    exit /b 1
-)
-
-echo [..] Starting download...
+echo [..] Starting download (CUDA blinded for compatibility)...
 
 python -c ^
-"from airllm import AutoModel; print('Downloading model...'); AutoModel.from_pretrained('%MODEL%'); print('Done!')"
+"import os; os.environ['CUDA_VISIBLE_DEVICES'] = ''; from airllm import AutoModel; print('Downloading %MODEL%...'); model = AutoModel.from_pretrained('%MODEL%'); print('Done!')"
 
 if %ERRORLEVEL% neq 0 (
     echo.
