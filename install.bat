@@ -91,45 +91,15 @@ if %ERRORLEVEL% neq 0 (
 )
 echo [OK] Base PyTorch installed.
 
-REM ---- Detect CUDA via Python ----
+REM ---- Detect CUDA via Python (single-line to avoid cmd.exe escaping issues) ----
 echo.
 echo [..] Checking for CUDA-capable GPU...
-python -c "
-import torch, sys, subprocess, os
-
-# Method 1: torch CUDA check
-if torch.cuda.is_available():
-    print('CUDA_AVAILABLE=1')
-    print('GPU=' + torch.cuda.get_device_name(0))
-    cuda_ver = torch.version.cuda
-    print('CUDA_VERSION=' + (cuda_ver or 'unknown'))
-    sys.exit(0)
-
-# Method 2: try nvidia-smi (may not be in PATH but worth checking)
-try:
-    result = subprocess.run(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader'],
-                          capture_output=True, text=True, timeout=5)
-    if result.returncode == 0 and result.stdout.strip():
-        print('CUDA_AVAILABLE=1')
-        print('GPU=' + result.stdout.strip())
-        sys.exit(0)
-except:
-    pass
-
-# Method 3: check for nvcuda.dll (NVIDIA driver present even without nvidia-smi in PATH)
-if os.path.exists(os.environ.get('SystemRoot', 'C:\\Windows') + '\\System32\\nvcuda.dll'):
-    print('CUDA_AVAILABLE=1')
-    print('GPU=NVIDIA detected via nvcuda.dll')
-    sys.exit(0)
-
-print('CUDA_AVAILABLE=0')
-" > "%TEMP%\airllm_cuda_detect.txt" 2>&1
-
-type "%TEMP%\airllm_cuda_detect.txt"
+python -c "import torch,os; print('CUDA_AVAILABLE=1' if torch.cuda.is_available() else 'CUDA_AVAILABLE=0')" >"%TEMP%\airllm_cuda.txt"
+type "%TEMP%\airllm_cuda.txt"
 echo.
 
 REM Parse detection result
-findstr "CUDA_AVAILABLE=1" "%TEMP%\airllm_cuda_detect.txt" >nul 2>&1
+findstr "CUDA_AVAILABLE=1" "%TEMP%\airllm_cuda.txt" >nul 2>&1
 if !ERRORLEVEL! equ 0 (
     if "!FORCE_CPU!"=="0" (
         set HAS_CUDA=1
@@ -177,15 +147,7 @@ echo [OK] All dependencies installed.
 REM ---- Verify torch CUDA status ----
 echo.
 echo [..] Verifying final PyTorch setup...
-python -c "
-import torch
-print('  PyTorch: ' + torch.__version__)
-print('  CUDA built-in: ' + str(torch.backends.cuda.is_built()))
-print('  CUDA available: ' + str(torch.cuda.is_available()))
-if torch.cuda.is_available():
-    print('  GPU: ' + torch.cuda.get_device_name(0))
-    print('  Memory: %.1f GB' % (torch.cuda.get_device_properties(0).total_mem / 1e9))
-"
+python -c "import torch; v=torch.__version__; b=torch.backends.cuda.is_built(); a=torch.cuda.is_available(); print('  PyTorch: '+v); print('  CUDA built-in: '+str(b)); print('  CUDA available: '+str(a)); print('  GPU: '+torch.cuda.get_device_name(0)+'  Mem: %.1f GB'%(torch.cuda.get_device_properties(0).total_mem/1e9)) if a else None"
 
 REM ---- Step 4: Optional pre-download model ----
 if /I "%~1"=="--download-model" (

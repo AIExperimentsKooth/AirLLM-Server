@@ -33,8 +33,7 @@ call venv\Scripts\activate.bat
 
 echo [..] Starting download (CUDA blinded for compatibility)...
 
-python -c ^
-"import os; os.environ['CUDA_VISIBLE_DEVICES'] = ''; from airllm import AutoModel; print('Downloading %MODEL%...'); model = AutoModel.from_pretrained('%MODEL%'); print('Done!')"
+python -c "import os; os.environ['CUDA_VISIBLE_DEVICES']=''; from airllm import AutoModel; print('Downloading %MODEL%...'); m=AutoModel.from_pretrained('%MODEL%'); print('Done!')"
 
 if %ERRORLEVEL% neq 0 (
     echo.
