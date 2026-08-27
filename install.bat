@@ -85,6 +85,18 @@ echo.
 echo [..] Step 2/3: Installing AirLLM and server dependencies...
 python -m pip install -r requirements.txt
 if !ERRORLEVEL! neq 0 (
+    echo [WARN] Some deps failed — retrying key packages individually...
+    python -m pip install airllm fastapi uvicorn pydantic transformers sentencepiece requests
+)
+
+REM On Windows, bitsandbytes needs the -windows variant
+echo.
+echo [..] Installing model compression library...
+python -m pip install bitsandbytes-windows 2>nul
+if !ERRORLEVEL! neq 0 (
+    echo [INFO] bitsandbytes-windows not available — compression will fall back to built-in
+)
+if !ERRORLEVEL! neq 0 (
     echo [ERROR] Dependency install failed
     pause
     exit /b 1

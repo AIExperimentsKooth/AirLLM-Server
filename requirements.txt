@@ -19,5 +19,6 @@ sentencepiece>=0.2.0
 pydantic>=2.0.0
 requests>=2.31.0
 
-# Optional: model compression for faster loading
-# bitsandbytes>=0.43.0  --  Windows support via bitsandbytes-windows
+# Model compression: 4-bit/8-bit quantization (auto-enabled for models >= 7B)
+# On Windows: pip install bitsandbytes-windows (see install.bat)
+bitsandbytes>=0.43.0
