@@ -53,6 +53,7 @@ DELETE_ORIGINAL = os.environ.get("AIRLLM_DELETE_ORIGINAL", None)
 CACHE_MODE = os.environ.get("AIRLLM_CACHE", "turbo")  # "turbo" or "stream"
 VRAM_HEADROOM = float(os.environ.get("AIRLLM_VRAM_HEADROOM", "0.10"))  # 10% for compute
 RAM_HEADROOM = float(os.environ.get("AIRLLM_RAM_HEADROOM", "0.05"))   # 5% for OS
+LOCAL_MODEL = os.environ.get("AIRLLM_LOCAL_MODEL", None)  # "true" to keep model files local
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -97,6 +98,49 @@ def resolve_device() -> str:
     if cuda_avail:
         return "cuda"
     return "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Local model setup (keep all model files on the same drive as the server)
+# ---------------------------------------------------------------------------
+def setup_local_model():
+    """Create local model directory and configure shards path.
+
+    When --local-model / AIRLLM_LOCAL_MODEL=true is set, the sharded
+    layer files (which are read on every inference) are stored next to
+    the server.  This keeps them on the same physical drive, reducing
+    fragmentation and disk-head seek time.
+
+    Directory layout:
+      ./model/splitted/   -- sharded layer files (read on every inference)
+      ./model/hf_cache/   -- optional: HuggingFace cache symlink target
+      ./model/downloads/  -- optional: HF cached downloads
+    """
+    import shutil
+
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
+    shards_dir = os.path.join(local, "splitted")
+    os.makedirs(shards_dir, exist_ok=True)
+    logger.info("Local model directory: %s", local)
+
+    # Point AirLLM's shards here
+    global LAYER_SHARDS_PATH
+    LAYER_SHARDS_PATH = shards_dir
+
+    # Optionally symlink the HF cache into the local tree so everything
+    # lives under one parent directory (no effect on reads, but helps
+    # drive-defragmentation and backup tools see a single tree).
+    hf_cache_default = os.path.expanduser("~/.cache/huggingface")
+    hf_local = os.path.join(local, "hf_cache")
+    if os.path.isdir(hf_cache_default) and not os.path.islink(hf_local):
+        try:
+            os.symlink(hf_cache_default, hf_local)
+            logger.info("Symlinked HF cache to %s", hf_local)
+        except (OSError, PermissionError):
+            # Symlinks may fail on Windows without admin — harmless
+            pass
+
+    return local
 
 
 # ===================================================================
@@ -320,6 +364,10 @@ class TurboCache:
 # ---------------------------------------------------------------------------
 def load_model():
     """Download (if needed) and load the model via AirLLM."""
+    # ── Local model setup (same drive as server) ──
+    if LOCAL_MODEL and LOCAL_MODEL.lower() in ("true", "1", "yes", "--local-model"):
+        setup_local_model()
+
     device = resolve_device()
     cuda_built = torch.backends.cuda.is_built()
     cuda_avail = cuda_built and torch.cuda.is_available()
@@ -357,6 +405,8 @@ def load_model():
     logger.info(f"Device:    {device}")
     logger.info(f"Compress:  {kwargs.get('compression', 'none')}")
     logger.info(f"Cache:     {CACHE_MODE}")
+    if LAYER_SHARDS_PATH:
+        logger.info(f"Shards:    {LAYER_SHARDS_PATH}")
     logger.info("=" * 55)
     logger.info("")
 
@@ -762,12 +812,15 @@ if __name__ == "__main__":
     for a in sys.argv[1:]:
         if a == "--chat": mode = "chat"
         elif a == "--benchmark": mode = "benchmark"
+        elif a == "--local-model": LOCAL_MODEL = "true"
         elif a == "--help" or a == "-h": print(__doc__); sys.exit(0)
 
     logger.info("AirLLM OpenAI-Compatible Server")
     logger.info(f"Model:   {MODEL_NAME}")
     logger.info(f"Context: {MAX_CONTEXT_LENGTH}")
     logger.info(f"Cache:   {CACHE_MODE}")
+    if LOCAL_MODEL and LOCAL_MODEL.lower() in ("true", "1", "yes", "--local-model"):
+        logger.info(f"Local:   yes (shards in ./model/)")
     logger.info(f"Mode:    {mode}")
     logger.info("")
 
