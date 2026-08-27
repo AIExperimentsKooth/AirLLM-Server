@@ -42,6 +42,16 @@ echo [OK] Python:
 python --version
 echo.
 
+REM ---- Handle flags ----
+set FLAG_DOWNLOAD=0
+set FLAG_FORCE_CPU=0
+if /I "%~1"=="--download-model" set FLAG_DOWNLOAD=1
+if /I "%~2"=="--download-model" set FLAG_DOWNLOAD=1
+if /I "%~3"=="--download-model" set FLAG_DOWNLOAD=1
+if /I "%~1"=="--force-cpu" set FLAG_FORCE_CPU=1
+if /I "%~2"=="--force-cpu" set FLAG_FORCE_CPU=1
+if /I "%~3"=="--force-cpu" set FLAG_FORCE_CPU=1
+
 REM ---- Create virtual environment ----
 if not exist venv\ (
     echo [..] Creating virtual environment...
@@ -67,53 +77,83 @@ if %ERRORLEVEL% neq 0 (
 )
 echo [OK] Virtual environment activated.
 
-REM ---- Handle --force-cpu flag ----
-set FORCE_CPU=0
-if /I "%~1"=="--force-cpu" (
-    set FORCE_CPU=1
-    echo.
-    echo [INFO] --force-cpu: installing CPU-only PyTorch regardless.
-)
-if /I "%~2"=="--force-cpu" set FORCE_CPU=1
-if /I "%~3"=="--force-cpu" set FORCE_CPU=1
-
 REM ============================================================================
-REM Step 1: Install CPU-only PyTorch first (small, fast download)
-REM Then use Python to detect if CUDA is actually available.
-REM This avoids all the encoding/batch-parsing nonsense with wmic/findstr.
+REM Step 1: Install CPU-only PyTorch (small download, always works)
 REM ============================================================================
 echo.
 echo [..] Step 1/4: Installing base PyTorch (CPU edition)...
 python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-if %ERRORLEVEL% neq 0 (
-    echo [WARN] CPU PyTorch install had issues — trying default index...
+if !ERRORLEVEL! neq 0 (
+    echo [WARN] CPU PyTorch install failed — trying default index...
     python -m pip install torch
+    if !ERRORLEVEL! neq 0 (
+        echo [ERROR] Could not install PyTorch at all. Check your internet connection.
+        pause
+        exit /b 1
+    )
 )
 echo [OK] Base PyTorch installed.
 
-REM ---- Detect CUDA via Python (single-line to avoid cmd.exe escaping issues) ----
+REM ============================================================================
+REM Step 2: Detect CUDA via a .py file (avoids all cmd quoting issues)
+REM ============================================================================
 echo.
 echo [..] Checking for CUDA-capable GPU...
-python -c "import torch,os; print('CUDA_AVAILABLE=1' if torch.cuda.is_available() else 'CUDA_AVAILABLE=0')" >"%TEMP%\airllm_cuda.txt"
-type "%TEMP%\airllm_cuda.txt"
-echo.
 
-REM Parse detection result
-findstr "CUDA_AVAILABLE=1" "%TEMP%\airllm_cuda.txt" >nul 2>&1
+REM Write detection script to a temp file
+echo import torch, sys, subprocess, os >"%TEMP%\airllm_cuda_check.py"
+echo. >>"%TEMP%\airllm_cuda_check.py"
+echo # Method 1: torch CUDA check >>"%TEMP%\airllm_cuda_check.py"
+echo if torch.cuda.is_available(): >>"%TEMP%\airllm_cuda_check.py"
+echo     print("CUDA_AVAILABLE=1") >>"%TEMP%\airllm_cuda_check.py"
+echo     print("GPU=" + torch.cuda.get_device_name(0)) >>"%TEMP%\airllm_cuda_check.py"
+echo     sys.exit(0) >>"%TEMP%\airllm_cuda_check.py"
+echo. >>"%TEMP%\airllm_cuda_check.py"
+echo # Method 2: nvidia-smi >>"%TEMP%\airllm_cuda_check.py"
+echo try: >>"%TEMP%\airllm_cuda_check.py"
+echo     result = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"], >>"%TEMP%\airllm_cuda_check.py"
+echo                           capture_output=True, text=True, timeout=5) >>"%TEMP%\airllm_cuda_check.py"
+echo     if result.returncode == 0 and result.stdout.strip(): >>"%TEMP%\airllm_cuda_check.py"
+echo         print("CUDA_AVAILABLE=1") >>"%TEMP%\airllm_cuda_check.py"
+echo         print("GPU=" + result.stdout.strip()) >>"%TEMP%\airllm_cuda_check.py"
+echo         sys.exit(0) >>"%TEMP%\airllm_cuda_check.py"
+echo except: >>"%TEMP%\airllm_cuda_check.py"
+echo     pass >>"%TEMP%\airllm_cuda_check.py"
+echo. >>"%TEMP%\airllm_cuda_check.py"
+echo # Method 3: nvcuda.dll check >>"%TEMP%\airllm_cuda_check.py"
+echo dll_path = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32", "nvcuda.dll") >>"%TEMP%\airllm_cuda_check.py"
+echo if os.path.exists(dll_path): >>"%TEMP%\airllm_cuda_check.py"
+echo     print("CUDA_AVAILABLE=1") >>"%TEMP%\airllm_cuda_check.py"
+echo     print("GPU=NVIDIA detected") >>"%TEMP%\airllm_cuda_check.py"
+echo     sys.exit(0) >>"%TEMP%\airllm_cuda_check.py"
+echo. >>"%TEMP%\airllm_cuda_check.py"
+echo print("CUDA_AVAILABLE=0") >>"%TEMP%\airllm_cuda_check.py"
+
+python "%TEMP%\airllm_cuda_check.py" >"%TEMP%\airllm_cuda_result.txt" 2>&1
+type "%TEMP%\airllm_cuda_result.txt"
+echo.
+del "%TEMP%\airllm_cuda_check.py"
+
+REM Parse result
+findstr "CUDA_AVAILABLE=1" "%TEMP%\airllm_cuda_result.txt" >nul 2>&1
 if !ERRORLEVEL! equ 0 (
-    if "!FORCE_CPU!"=="0" (
-        set HAS_CUDA=1
-        echo [OK] CUDA-capable GPU detected!
-    ) else (
-        set HAS_CUDA=0
-        echo [INFO] --force-cpu active, using CPU-only PyTorch.
-    )
+    set HAS_CUDA=1
 ) else (
     set HAS_CUDA=0
+)
+
+if "!HAS_CUDA!"=="1" if "!FLAG_FORCE_CPU!"=="1" (
+    set HAS_CUDA=0
+    echo [INFO] --force-cpu active, keeping CPU-only PyTorch.
+)
+
+if "!HAS_CUDA!"=="1" (
+    echo [OK] CUDA-capable GPU detected!
+) else (
     echo [INFO] No CUDA-capable GPU detected — using CPU-only PyTorch.
 )
 
-REM ---- Step 2: Reinstall PyTorch with CUDA if detected ----
+REM ---- Step 2b: Reinstall PyTorch with CUDA if detected ----
 if "!HAS_CUDA!"=="1" (
     echo.
     echo [..] Step 2/4: Installing PyTorch with CUDA support...
@@ -123,16 +163,22 @@ if "!HAS_CUDA!"=="1" (
         python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
     )
     if !ERRORLEVEL! neq 0 (
-        echo [WARN] All CUDA PyTorch installs failed. Falling back to CPU...
+        echo [WARN] All CUDA installations failed. Falling back to CPU...
         python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+        if !ERRORLEVEL! neq 0 (
+            python -m pip install torch
+        )
+    ) else (
+        echo [OK] CUDA PyTorch installed.
     )
-    echo [OK] PyTorch reinstalled.
 ) else (
     echo.
-    echo [..] Step 2/4: Skipped (CPU-only torch already installed).
+    echo [..] Step 2/4: Skipped (CPU-only torch stays).
 )
 
-REM ---- Step 3: Install AirLLM and server dependencies ----
+REM ============================================================================
+REM Step 3: Install AirLLM and server dependencies
+REM ============================================================================
 echo.
 echo [..] Step 3/4: Installing AirLLM and server dependencies...
 python -m pip install -r requirements.txt
@@ -144,13 +190,16 @@ if !ERRORLEVEL! neq 0 (
 )
 echo [OK] All dependencies installed.
 
-REM ---- Verify torch CUDA status ----
+REM ---- Verify torch ----
 echo.
 echo [..] Verifying final PyTorch setup...
-python -c "import torch; v=torch.__version__; b=torch.backends.cuda.is_built(); a=torch.cuda.is_available(); print('  PyTorch: '+v); print('  CUDA built-in: '+str(b)); print('  CUDA available: '+str(a)); print('  GPU: '+torch.cuda.get_device_name(0)+'  Mem: %.1f GB'%(torch.cuda.get_device_properties(0).total_mem/1e9)) if a else None"
+python -c "import torch; v=torch.__version__; print('  PyTorch: '+v); print('  CUDA built-in: '+str(torch.backends.cuda.is_built())); print('  CUDA available: '+str(torch.cuda.is_available()))"
+del "%TEMP%\airllm_cuda_result.txt" 2>nul
 
-REM ---- Step 4: Optional pre-download model ----
-if /I "%~1"=="--download-model" (
+REM ============================================================================
+REM Step 4: Optional pre-download model
+REM ============================================================================
+if "!FLAG_DOWNLOAD!"=="1" (
     echo.
     echo [..] Step 4/4: Pre-downloading model Qwen/Qwen3.8-27B...
     echo     This will download ~16 GB from HuggingFace and shard it.
@@ -167,7 +216,9 @@ if /I "%~1"=="--download-model" (
     echo [..] Step 4/4: Skipped (use --download-model flag to pre-download)
 )
 
-REM ---- Done ----
+REM ============================================================================
+REM Done
+REM ============================================================================
 echo.
 echo ============================================================
 echo   Install complete!
