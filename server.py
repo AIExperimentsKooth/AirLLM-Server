@@ -63,6 +63,39 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 
 # ---------------------------------------------------------------------------
+# CUDA blinding (module-level to avoid torch dynamo conflicts)
+# ---------------------------------------------------------------------------
+def _blind_torch_cuda():
+    """Replace torch.cuda functions with no-ops to prevent CUDA probe errors.
+
+    AirLLM and bitsandbytes call torch.cuda functions internally during
+    from_pretrained() even when device='cpu' is passed.  On CPU-only torch
+    builds those calls raise 'Torch not compiled with CUDA enabled'.
+
+    This function replaces specific functions while preserving class
+    attributes (CUDAGraph, Stream, Event, etc.) that transformers need.
+    Must be called at module level or from a function — never inside a
+    torch.dynamo-traced context.
+    """
+    torch.cuda.is_available = lambda: False
+    torch.cuda.device_count = lambda: 0
+    torch.cuda.current_device = lambda: 0
+    torch.cuda.get_device_name = lambda i=0: "cpu"
+    torch.cuda.get_device_properties = lambda i=0: type('obj', (object,), {'total_mem': 1, 'name': 'cpu'})()
+    torch.cuda.memory_allocated = lambda d=None: 0
+    torch.cuda.max_memory_allocated = lambda d=None: 0
+    torch.cuda.memory_reserved = lambda d=None: 0
+    torch.cuda.max_memory_reserved = lambda d=None: 0
+    torch.cuda.memory_stats = lambda d=None: {}
+    torch.cuda.memory_summary = lambda d=None, **kw: ""
+    torch.cuda.empty_cache = lambda: None
+    torch.cuda.reset_peak_memory_stats = lambda d=None: None
+    torch.cuda.set_device = lambda d: None
+    torch.cuda.synchronize = lambda d=None: None
+    torch.cuda._lazy_init = lambda: None
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 class ModelState:
@@ -400,31 +433,14 @@ def load_model():
     # ── Monkey-patch torch.cuda before AirLLM import ────────────────
     # AirLLM and bitsandbytes call torch.cuda functions internally even
     # when device="cpu" is passed.  On CPU-only torch builds those calls
-    # raise "Torch not compiled with CUDA enabled".  We replace the
-    # entire torch.cuda module with a no-op stub so these calls are safe.
+    # raise "Torch not compiled with CUDA enabled".  We replace specific
+    # functions with no-ops while preserving the module's class attributes
+    # (CUDAGraph, Stream, Event, etc.) that transformers/torch need.
     _cuda_built = torch.backends.cuda.is_built()
     _cuda_avail = _cuda_built and torch.cuda.is_available()
     if not _cuda_avail:
         logger.info("Blinding torch.cuda to prevent AirLLM CUDA probe")
-
-        class _CudaStub:
-            def is_available(self): return False
-            def device_count(self): return 0
-            def current_device(self): return 0
-            def get_device_name(self, i=0): return "cpu"
-            def get_device_properties(self, i=0): return type('obj', (object,), {'total_mem': 1, 'name': 'cpu'})()
-            def memory_allocated(self, d=None): return 0
-            def max_memory_allocated(self, d=None): return 0
-            def memory_reserved(self, d=None): return 0
-            def max_memory_reserved(self, d=None): return 0
-            def empty_cache(self): return None
-            def reset_peak_memory_stats(self, d=None): return None
-            def set_device(self, d): return None
-            def synchronize(self, d=None): return None
-            def stream(self, s=None): return None
-            def __getattr__(self, name): return lambda *a, **kw: None
-
-        torch.cuda = _CudaStub()
+        _blind_torch_cuda()
 
     from airllm import AutoModel as AirLLMAutoModel
 
