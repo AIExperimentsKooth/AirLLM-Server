@@ -20,5 +20,6 @@ pydantic>=2.0.0
 requests>=2.31.0
 
 # Model compression: 4-bit/8-bit quantization (auto-enabled for models >= 7B)
-# On Windows: pip install bitsandbytes-windows (see install.bat)
-bitsandbytes>=0.43.0
+# AirLLM uses bitsandbytes.functional.quantize_nf4 which was removed in 0.44+
+# On Windows: pip install bitsandbytes-windows<0.44.0 (see install.bat)
+bitsandbytes>=0.43.0,<0.44.0
