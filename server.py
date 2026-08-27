@@ -397,6 +397,35 @@ def load_model():
     if DELETE_ORIGINAL and DELETE_ORIGINAL.lower() in ("true", "1", "yes"):
         kwargs["delete_original"] = True
 
+    # ── Monkey-patch torch.cuda before AirLLM import ────────────────
+    # AirLLM and bitsandbytes call torch.cuda functions internally even
+    # when device="cpu" is passed.  On CPU-only torch builds those calls
+    # raise "Torch not compiled with CUDA enabled".  We replace the
+    # entire torch.cuda module with a no-op stub so these calls are safe.
+    _cuda_built = torch.backends.cuda.is_built()
+    _cuda_avail = _cuda_built and torch.cuda.is_available()
+    if not _cuda_avail:
+        logger.info("Blinding torch.cuda to prevent AirLLM CUDA probe")
+
+        class _CudaStub:
+            def is_available(self): return False
+            def device_count(self): return 0
+            def current_device(self): return 0
+            def get_device_name(self, i=0): return "cpu"
+            def get_device_properties(self, i=0): return type('obj', (object,), {'total_mem': 1, 'name': 'cpu'})()
+            def memory_allocated(self, d=None): return 0
+            def max_memory_allocated(self, d=None): return 0
+            def memory_reserved(self, d=None): return 0
+            def max_memory_reserved(self, d=None): return 0
+            def empty_cache(self): return None
+            def reset_peak_memory_stats(self, d=None): return None
+            def set_device(self, d): return None
+            def synchronize(self, d=None): return None
+            def stream(self, s=None): return None
+            def __getattr__(self, name): return lambda *a, **kw: None
+
+        torch.cuda = _CudaStub()
+
     from airllm import AutoModel as AirLLMAutoModel
 
     logger.info("=" * 55)
